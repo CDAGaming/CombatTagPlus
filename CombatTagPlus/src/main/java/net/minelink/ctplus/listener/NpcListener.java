@@ -1,24 +1,25 @@
 package net.minelink.ctplus.listener;
 
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+
 import net.minelink.ctplus.CombatTagPlus;
 import net.minelink.ctplus.Npc;
 import net.minelink.ctplus.event.NpcDespawnEvent;
 import net.minelink.ctplus.event.NpcDespawnReason;
-import net.minelink.ctplus.task.SafeLogoutTask;
+import net.minelink.ctplus.event.CombatLogEvent;
+
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
-
-import java.util.UUID;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 public final class NpcListener implements Listener {
 
@@ -28,39 +29,14 @@ public final class NpcListener implements Listener {
         this.plugin = plugin;
     }
 
-    @EventHandler
-    public void spawnNpc(PlayerQuitEvent event) {
-        // Do nothing if player is not combat tagged and NPCs only spawn if tagged
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onCombatLog(CombatLogEvent event) {
         Player player = event.getPlayer();
-        boolean isTagged = plugin.getTagManager().isTagged(player.getUniqueId());
-        if (!isTagged && !plugin.getSettings().alwaysSpawn()) return;
 
-        // Do nothing if a player logs off in combat in a WorldGuard protected region
-        if (!plugin.getHookManager().isPvpEnabledAt(player.getLocation())) return;
+        if (plugin.getSettings().instantlyKill()) return; // Let instakill handle it
 
-        // Do nothing if player has permission
-        if (player.hasPermission("ctplus.bypass.tag")) return;
-
-        // Do nothing if player has safely logged out
-        if (SafeLogoutTask.isFinished(player)) return;
-
-        // Kill player if configuration states so
-        if (isTagged && plugin.getSettings().instantlyKill()) {
-            player.setHealth(0);
-            return;
-        }
-
-        // Do nothing if NPC already exists
-        final Npc npc = plugin.getNpcManager().spawn(player);
-        if (npc == null) return;
-
-        // Despawn NPC after npc-despawn-time has elapsed in ticks
-        Bukkit.getScheduler().runTaskLater(plugin, new Runnable() {
-            @Override
-            public void run() {
-                plugin.getNpcManager().despawn(npc);
-            }
-        }, plugin.getSettings().getNpcDespawnTicks());
+        // Spawn a new NPC
+        plugin.getNpcManager().spawn(player);
     }
 
     @EventHandler
@@ -90,10 +66,39 @@ public final class NpcListener implements Listener {
         Bukkit.getScheduler().scheduleSyncDelayedTask(plugin, new Runnable() {
             @Override
             public void run() {
-                plugin.getNpcManager().despawn(npc);
-                Bukkit.getPluginManager().callEvent(new NpcDespawnEvent(npc, NpcDespawnReason.DEATH));
+                plugin.getNpcManager().despawn(npc, NpcDespawnReason.DEATH);
             }
         });
+    }
+
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.NORMAL)
+    public void onNPCDamage(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player)) return; // Check if the attacker is a player
+        if (!(event.getEntity() instanceof Player) || !plugin.getNpcPlayerHelper().isNpc((Player) event.getEntity())) return; // Check if the defender is an entity
+        Player attacker = (Player) event.getDamager();
+        Player npc = (Player) event.getEntity();
+        UUID npcPlayerId = plugin.getNpcPlayerHelper().getIdentity(npc).getId();
+    }
+
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+    public void updateDespawnTime(EntityDamageByEntityEvent event) {
+        // Do nothing if we are not to update NPC despawn time on hit
+        if (!plugin.getSettings().resetDespawnTimeOnHit()) return;
+
+        // Do nothing if entity damaged is not a player
+        if (!(event.getEntity() instanceof Player)) return;
+
+        // Do nothing if player damaged is not a NPC
+        Player player = (Player) event.getEntity();
+        if (!plugin.getNpcPlayerHelper().isNpc(player)) return;
+
+        // Update the NPC despawn time
+        UUID npcId = plugin.getNpcPlayerHelper().getIdentity(player).getId();
+        Npc npc = plugin.getNpcManager().getSpawnedNpc(npcId);
+        if (plugin.getNpcManager().hasDespawnTask(npc)) {
+            long despawnTime = System.currentTimeMillis() + plugin.getSettings().getNpcDespawnMillis();
+            plugin.getNpcManager().getDespawnTask(npc).setTime(despawnTime);
+        }
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -160,7 +165,7 @@ public final class NpcListener implements Listener {
         player.setMaximumAir(npcPlayer.getMaximumAir());
         player.setRemainingAir(npcPlayer.getRemainingAir());
         player.setHealthScale(npcPlayer.getHealthScale());
-        player.setMaxHealth(npcPlayer.getMaxHealth());
+        player.setMaxHealth(getMaxHealth(npcPlayer));
         player.setHealth(npcPlayer.getHealth());
         player.setTotalExperience(npcPlayer.getTotalExperience());
         player.setFoodLevel(npcPlayer.getFoodLevel());
@@ -170,6 +175,21 @@ public final class NpcListener implements Listener {
         player.getInventory().setContents(npcPlayer.getInventory().getContents());
         player.getInventory().setArmorContents(npcPlayer.getInventory().getArmorContents());
         player.addPotionEffects(npcPlayer.getActivePotionEffects());
+    }
+    
+    //This is to protect agenst players with the health boost potion effect.
+    //This stops the max health from going up when the player has health boost since it adds to the max health.
+    @SuppressWarnings("deprecation")
+	private double getMaxHealth(Player npcPlayer){
+    	double health = npcPlayer.getMaxHealth();
+    	for(PotionEffect p : npcPlayer.getActivePotionEffects()){
+            //Had to do this because doing if(p.getType() == PotionEffectType.HEALTH_BOOST)
+            //It wouldn't recognize it as the same.
+    		if(p.getType().getName().equalsIgnoreCase(PotionEffectType.HEALTH_BOOST.getName())){
+    			health -= ((p.getAmplifier() + 1) * 4);
+    		}
+    	}
+    	return health;
     }
 
 }
